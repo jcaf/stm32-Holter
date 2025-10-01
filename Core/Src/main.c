@@ -14,6 +14,12 @@
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
+  ******************************************************************************
+  SPI:
+  A4 - CS
+  A5 - SCK
+  A6 - MISO
+  A7 - MOSI
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -66,6 +72,12 @@ static void MX_ADC1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+static void log_uart(const char *txt, FRESULT fr)
+{
+    char buf[64];
+    int n = sprintf(buf, "%s: %d\r\n", txt, fr);
+    HAL_UART_Transmit(&huart1, (uint8_t*)buf, n, HAL_MAX_DELAY);
+}
 
 /* USER CODE END PFP */
 
@@ -131,9 +143,12 @@ static FRESULT Open_Next_File(FIL *fp)
   for (int i = 1; i < 1000; ++i)
   {
     snprintf(name, sizeof(name), "FILE_%03d.ECG", i);
+
     FILINFO finfo;
+
     if (f_stat(name, &finfo) == FR_OK)
       continue;        // existe, prueba siguiente
+
     return f_open(fp, name, FA_CREATE_ALWAYS | FA_WRITE);
   }
   return FR_DISK_ERR;
@@ -212,25 +227,61 @@ int main(void)
 //       HAL_Delay(10); // muestreo aprox. ~500 Hz (ajusta si necesitas más rápido)
 //   }
   /* Montar SD */
-    if (f_mount(&SDFatFs, (TCHAR const*)SDPath, 1) != FR_OK) {
+  //if (f_mount(&SDFatFs, (TCHAR const*)SDPath, 1) != FR_OK)
+  //if (f_mount(&SDFatFs, (TCHAR const*)USERPath, 1) != FR_OK)
+  /*if (f_mount(&SDFatFs, "", 0)!= FR_OK)
+  {
       // error SD
       while (1);
     }
 
-    /* Abrir siguiente archivo FILE_###.ECG */
+    //Abrir siguiente archivo FILE_###.ECG
     if (Open_Next_File(&file) != FR_OK) {
       while (1);
     }
+    */
+  	  log_uart("Inicialiazando....", 0 );
+
+  	  /* Montar SD */
+    FRESULT fr;
+    fr = f_mount(&SDFatFs, "", 0);
+    log_uart("f_mount", fr);
+    if (fr != FR_OK) {
+        while (1);  // aquí sabrás el código exacto
+    }
+
+    //
+//    fr = Open_Next_File(&file);
+//    log_uart("Open_Next_File", fr);
+//    if (fr != FR_OK) {
+//        while (1);
+//    }
+    //f_open(fp, name, FA_CREATE_ALWAYS | FA_WRITE);
+
+
+      f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
+      //f_lseek(&file, file.fsize);
+      //f_puts("hoy termino!\n", &file);
+      //f_close(&file);
+
+      char bb[]="hola1";
+      UINT wrote = 0;
+      fr = f_write(&file, bb, 5, &wrote);
+      f_close(&file);
 
     /* Iniciar adquisición determinista: TIM2 -> ADC -> DMA (circular) */
     ECG_Start();
 
     /* Objetivo: 30 s @ 500 Hz => 15000 muestras */
-    uint32_t targetSamples  = 30U * ECG_FS_HZ;
+    uint32_t targetSamples  = 5U * ECG_FS_HZ;
     uint32_t writtenSamples = 0;
 
-    while (writtenSamples < targetSamples) {
-      if (half_ready) {
+    while (writtenSamples < targetSamples)
+    {
+      if (half_ready)
+      {
+    	  log_uart("half_ready", fr);
+
         half_ready = 0;
         /* Escribir PRIMERA mitad del buffer: 1024 muestras => 2048 bytes (big-endian) */
         write_half_bigendian(&file, &adcBuf[0], HALF_SAMPLES);
@@ -246,7 +297,9 @@ int main(void)
 
     ECG_Stop();
     f_close(&file);
-    f_mount(NULL, (TCHAR const*)SDPath, 1);   // desmontar
+    //f_mount(NULL, (TCHAR const*)SDPath, 1);   // desmontar
+    //f_mount(NULL, (TCHAR const*)USERPath, 1);   // desmontar
+
 
     /* Señal de fin OK (parpadeo LED si quieres) */
     while (1) {
@@ -393,7 +446,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_HARD_OUTPUT;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
@@ -443,21 +496,21 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_OC_Init(&htim2) != HAL_OK)
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC2REF;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 0;
+  sConfigOC.OCMode = TIM_OCMODE_PWM2;
+  sConfigOC.Pulse = 50;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_OC_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -538,12 +591,22 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
   /*Configure GPIO pin : PC14 */
   GPIO_InitStruct.Pin = GPIO_PIN_14;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
