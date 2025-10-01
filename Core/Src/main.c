@@ -110,27 +110,37 @@ static void write_half_bigendian(FIL *fp, const uint16_t *src, UINT nSamples);
 /* ============ Adquisición ============ */
 static void ECG_Start(void)
 {
+	/* Arrancar la salida OC2 (generar OC2REF) */
+	  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+
+	  /* Iniciar timer que dispara el ADC a 500 Hz (TIM2->TRGO configurado en Cube) */
+	    HAL_TIM_Base_Start(&htim2);
+
   /* DMA circular llenando adcBuf */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcBuf, BUF_SAMPLES);
 
-  /* Iniciar timer que dispara el ADC a 500 Hz (TIM2->TRGO configurado en Cube) */
-  HAL_TIM_Base_Start(&htim2);
+
 }
 
 static void ECG_Stop(void)
 {
-  HAL_TIM_Base_Stop(&htim2);
-  HAL_ADC_Stop_DMA(&hadc1);
+	HAL_ADC_Stop_DMA(&hadc1);
+	HAL_TIM_Base_Stop(&htim2);
+	  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
 }
 
 /* Callbacks DMA: marcan qué mitad del buffer está lista para escribir */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1) half_ready = 1;
+
+  //HAL_UART_Transmit(&huart1, (uint8_t *)"Half\r\n", 6, HAL_MAX_DELAY);
 }
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1) full_ready = 1;
+
+  //HAL_UART_Transmit(&huart1, (uint8_t *)"Full\r\n", 6, HAL_MAX_DELAY);
 }
 
 /* ============ SD helpers ============ */
@@ -260,14 +270,13 @@ int main(void)
 
 
       f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
-      //f_lseek(&file, file.fsize);
-      //f_puts("hoy termino!\n", &file);
-      //f_close(&file);
-
-      char bb[]="hola1";
-      UINT wrote = 0;
-      fr = f_write(&file, bb, 5, &wrote);
-      f_close(&file);
+															  //f_lseek(&file, file.fsize);
+															  //f_puts("hoy termino!\n", &file);
+															  //f_close(&file);
+//      char bb[]="hola1";
+//      UINT wrote = 0;
+//      fr = f_write(&file, bb, 5, &wrote);
+//      f_close(&file);
 
     /* Iniciar adquisición determinista: TIM2 -> ADC -> DMA (circular) */
     ECG_Start();
