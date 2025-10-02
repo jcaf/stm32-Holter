@@ -207,7 +207,8 @@ static FRESULT Open_Next_File(FIL *fp)
     if (f_stat(name, &finfo) == FR_OK)
       continue;        // existe, prueba siguiente
 
-    return f_open(fp, name, FA_CREATE_ALWAYS | FA_WRITE);
+    return f_open(fp, name, FA_CREATE_ALWAYS | FA_WRITE | FA_READ);
+
   }
   return FR_DISK_ERR;
 }
@@ -273,87 +274,36 @@ int main(void)
 
 
   /* USER CODE BEGIN 2 */
-  /* Ejemplo enviar texto por USART1 */
-//  uint8_t msg[] = "When I fall in love!\r\n";
-//  while (1)
-//   {
-//       HAL_ADC_Start(&hadc1);
-//       if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-//       {
-//           uint16_t val = HAL_ADC_GetValue(&hadc1);
-//           char buf[32];
-//           int n = sprintf(buf, "%u\n", val);  // enviar como texto, un valor por línea
-//           HAL_UART_Transmit(&huart1, (uint8_t*)buf, n, HAL_MAX_DELAY);
-//       }
-//       HAL_Delay(10); // muestreo aprox. ~500 Hz (ajusta si necesitas más rápido)
-//   }
-  /* Montar SD */
-  //if (f_mount(&SDFatFs, (TCHAR const*)SDPath, 1) != FR_OK)
-  //if (f_mount(&SDFatFs, (TCHAR const*)USERPath, 1) != FR_OK)
-  /*if (f_mount(&SDFatFs, "", 0)!= FR_OK)
-  {
-      // error SD
-      while (1);
-    }
-
-    //Abrir siguiente archivo FILE_###.ECG
-    if (Open_Next_File(&file) != FR_OK) {
-      while (1);
-    }
-    */
-
-  // Configurar: 1 octubre 2025, 21:45:00, miércoles (3)
+  // Configurar: 11:34:20, jueves (4), 2 octubre 2025
   //DS3231_SetTimeDate(11, 34, 20, 4, 2, 10, 25);
-
 
   RTC_DateTime now;
   char buf[64];
-  //log_uart("Enviando DS3231....", 0 );
-  while (1)
-  {
-	  //log_uart("Enviando DS3231....", 0 );
-	    DS3231_GetTimeDate(&now);
-
-
-	    sprintf(buf, "%02d/%02d/20%02d %02d:%02d:%02d\r\n",
-	            now.date, now.month, now.year,
-	            now.hour, now.min, now.sec);
-
-	    HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
-
-	    HAL_Delay(1000);
-  }
 
 
   /////////////////////////////////////////////////////
-  	  log_uart("Inicialiazando....", 0 );
+  	log_uart("Inicialiazando....", 0 );
 
-  	  /* Montar SD */
+  	/* Montar SD */
     FRESULT fr;
     fr = f_mount(&SDFatFs, "", 0);
-    log_uart("f_mount", fr);
+    log_uart("Montando SD", fr);
     if (fr != FR_OK)
     {
+    	log_uart("Error montando SD", 0 );
         while (1);  // aquí sabrás el código exacto
     }
 
-    //
-//    fr = Open_Next_File(&file);
-//    log_uart("Open_Next_File", fr);
-//    if (fr != FR_OK) {
-//        while (1);
-//    }
-    //f_open(fp, name, FA_CREATE_ALWAYS | FA_WRITE);
+    //Crear un nuevo archivo
+    fr = Open_Next_File(&file);
+    log_uart("Creando nuevo archivo", fr);
+    if (fr != FR_OK)
+    {
+    	log_uart("Error creando nuevo archivo", 0 );
+        while (1);
+    }
 
-
-      f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
-															  //f_lseek(&file, file.fsize);
-															  //f_puts("hoy termino!\n", &file);
-															  //f_close(&file);
-//      char bb[]="hola1";
-//      UINT wrote = 0;
-//      fr = f_write(&file, bb, 5, &wrote);
-//      f_close(&file);
+    //f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
 
     /* Iniciar adquisición determinista: TIM2 -> ADC -> DMA (circular) */
     ECG_Start();
