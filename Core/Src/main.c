@@ -52,6 +52,8 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+I2C_HandleTypeDef hi2c1;
+
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim2;
@@ -71,6 +73,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 static void log_uart(const char *txt, FRESULT fr)
 {
@@ -78,6 +81,51 @@ static void log_uart(const char *txt, FRESULT fr)
     int n = sprintf(buf, "%s: %d\r\n", txt, fr);
     HAL_UART_Transmit(&huart1, (uint8_t*)buf, n, HAL_MAX_DELAY);
 }
+uint8_t decToBcd(uint8_t val) {
+    return ( (val/10*16) + (val%10) );
+}
+uint8_t bcdToDec(uint8_t val) {
+    return ( (val/16*10) + (val%16) );
+}
+void DS3231_SetTimeDate(uint8_t hour, uint8_t min, uint8_t sec,
+                        uint8_t day, uint8_t date, uint8_t month, uint8_t year)
+{
+    uint8_t buffer[7];
+    buffer[0] = decToBcd(sec);
+    buffer[1] = decToBcd(min);
+    buffer[2] = decToBcd(hour);   // formato 24h
+    buffer[3] = decToBcd(day);    // 1=lunes … 7=domingo
+    buffer[4] = decToBcd(date);
+    buffer[5] = decToBcd(month);
+    buffer[6] = decToBcd(year);   // últimos 2 dígitos
+
+    HAL_I2C_Mem_Write(&hi2c1, 0xD0, 0x00, 1, buffer, 7, HAL_MAX_DELAY);
+}
+typedef struct {
+    uint8_t sec;
+    uint8_t min;
+    uint8_t hour;
+    uint8_t day;    // día de la semana
+    uint8_t date;   // día del mes
+    uint8_t month;
+    uint8_t year;
+} RTC_DateTime;
+
+void DS3231_GetTimeDate(RTC_DateTime *dt)
+{
+    uint8_t buffer[7];
+    HAL_I2C_Mem_Read(&hi2c1, 0xD0, 0x00, 1, buffer, 7, HAL_MAX_DELAY);
+
+    dt->sec   = bcdToDec(buffer[0]);
+    dt->min   = bcdToDec(buffer[1]);
+    dt->hour  = bcdToDec(buffer[2] & 0x3F);  // máscara 24h
+    dt->day   = bcdToDec(buffer[3]);
+    dt->date  = bcdToDec(buffer[4]);
+    dt->month = bcdToDec(buffer[5]);
+    dt->year  = bcdToDec(buffer[6]);
+}
+
+
 
 /* USER CODE END PFP */
 
@@ -221,6 +269,9 @@ int main(void)
   MX_SPI1_Init();
   MX_FATFS_Init();
   MX_TIM2_Init();
+  MX_I2C1_Init();
+
+
   /* USER CODE BEGIN 2 */
   /* Ejemplo enviar texto por USART1 */
 //  uint8_t msg[] = "When I fall in love!\r\n";
@@ -250,13 +301,39 @@ int main(void)
       while (1);
     }
     */
+
+  // Configurar: 1 octubre 2025, 21:45:00, miércoles (3)
+  //DS3231_SetTimeDate(11, 34, 20, 4, 2, 10, 25);
+
+
+  RTC_DateTime now;
+  char buf[64];
+  //log_uart("Enviando DS3231....", 0 );
+  while (1)
+  {
+	  //log_uart("Enviando DS3231....", 0 );
+	    DS3231_GetTimeDate(&now);
+
+
+	    sprintf(buf, "%02d/%02d/20%02d %02d:%02d:%02d\r\n",
+	            now.date, now.month, now.year,
+	            now.hour, now.min, now.sec);
+
+	    HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
+
+	    HAL_Delay(1000);
+  }
+
+
+  /////////////////////////////////////////////////////
   	  log_uart("Inicialiazando....", 0 );
 
   	  /* Montar SD */
     FRESULT fr;
     fr = f_mount(&SDFatFs, "", 0);
     log_uart("f_mount", fr);
-    if (fr != FR_OK) {
+    if (fr != FR_OK)
+    {
         while (1);  // aquí sabrás el código exacto
     }
 
@@ -430,6 +507,40 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
 
 }
 
