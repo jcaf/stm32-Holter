@@ -87,6 +87,12 @@ uint8_t decToBcd(uint8_t val) {
 uint8_t bcdToDec(uint8_t val) {
     return ( (val/16*10) + (val%16) );
 }
+
+
+/* --- add near top --- */
+#define DS3231_ADDR_7BIT 0x68
+#define DS3231_ADDR      (DS3231_ADDR_7BIT << 1)
+
 void DS3231_SetTimeDate(uint8_t hour, uint8_t min, uint8_t sec,
                         uint8_t day, uint8_t date, uint8_t month, uint8_t year)
 {
@@ -99,7 +105,7 @@ void DS3231_SetTimeDate(uint8_t hour, uint8_t min, uint8_t sec,
     buffer[5] = decToBcd(month);
     buffer[6] = decToBcd(year);   // últimos 2 dígitos
 
-    HAL_I2C_Mem_Write(&hi2c1, 0xD0, 0x00, 1, buffer, 7, HAL_MAX_DELAY);
+    HAL_I2C_Mem_Write(&hi2c1, DS3231_ADDR, 0x00, 1, buffer, 7, HAL_MAX_DELAY);
 }
 typedef struct {
     uint8_t sec;
@@ -111,14 +117,26 @@ typedef struct {
     uint8_t year;
 } RTC_DateTime;
 
+/* ----------------- helpers ------------------ */
+static FRESULT write_timestamp_line(FIL *ftime, uint32_t block_idx, const RTC_DateTime *dt)
+{
+    char line[64];
+    int n = snprintf(line, sizeof(line), "%06lu,%04u-%02u-%02u %02u:%02u:%02u\r\n",
+                     (unsigned long)block_idx,
+                     2000 + dt->year, dt->month, dt->date,
+                     dt->hour, dt->min, dt->sec);
+    UINT bw = 0;
+    return f_write(ftime, line, n, &bw);
+}
+
+/* Use consistent HAL I2C functions: */
 void DS3231_GetTimeDate(RTC_DateTime *dt)
 {
     uint8_t buffer[7];
-    HAL_I2C_Mem_Read(&hi2c1, 0xD0, 0x00, 1, buffer, 7, HAL_MAX_DELAY);
-
+    HAL_I2C_Mem_Read(&hi2c1, DS3231_ADDR, 0x00, 1, buffer, 7, HAL_MAX_DELAY);
     dt->sec   = bcdToDec(buffer[0]);
     dt->min   = bcdToDec(buffer[1]);
-    dt->hour  = bcdToDec(buffer[2] & 0x3F);  // máscara 24h
+    dt->hour  = bcdToDec(buffer[2] & 0x3F);
     dt->day   = bcdToDec(buffer[3]);
     dt->date  = bcdToDec(buffer[4]);
     dt->month = bcdToDec(buffer[5]);
@@ -126,6 +144,35 @@ void DS3231_GetTimeDate(RTC_DateTime *dt)
 }
 
 
+/* ---- Función que crea ambos archivos (ECG + TST) con el mismo índice ---- */
+static FRESULT Open_Paired_Files(FIL *f_ecg, FIL *f_tst)
+{
+    char name_ecg[24], name_tst[24];
+    FRESULT fr;
+    for (int i = 1; i < 1000; ++i)
+    {
+        snprintf(name_ecg, sizeof(name_ecg), "FILE_%03d.ECG", i);
+        FILINFO finfo;
+        if (f_stat(name_ecg, &finfo) == FR_OK) continue; // existe, probar siguiente
+
+        // crear ECG
+        fr = f_open(f_ecg, name_ecg, FA_CREATE_ALWAYS | FA_WRITE | FA_READ);
+        if (fr != FR_OK) return fr;
+
+        // crear TST con mismo índice
+        snprintf(name_tst, sizeof(name_tst), "FILE_%03d.TST", i);
+        fr = f_open(f_tst, name_tst, FA_CREATE_ALWAYS | FA_WRITE | FA_READ);
+
+        if (fr != FR_OK)
+        {
+            f_close(f_ecg);
+            return fr;
+        }
+
+        return FR_OK; // ambos creados
+    }
+    return FR_DISK_ERR;
+}
 
 /* USER CODE END PFP */
 
@@ -145,7 +192,7 @@ static volatile uint8_t full_ready = 0;
 
 /* ---- SD/FatFS ---- */
 FATFS SDFatFs;
-FIL   file;
+//FIL   file;
 UINT  bw;
 
 /* ---- Prototipos ---- */
@@ -174,7 +221,7 @@ static void ECG_Stop(void)
 {
 	HAL_ADC_Stop_DMA(&hadc1);
 	HAL_TIM_Base_Stop(&htim2);
-	  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+	HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
 }
 
 /* Callbacks DMA: marcan qué mitad del buffer está lista para escribir */
@@ -182,13 +229,11 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1) half_ready = 1;
 
-  //HAL_UART_Transmit(&huart1, (uint8_t *)"Half\r\n", 6, HAL_MAX_DELAY);
 }
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1) full_ready = 1;
 
-  //HAL_UART_Transmit(&huart1, (uint8_t *)"Full\r\n", 6, HAL_MAX_DELAY);
 }
 
 /* ============ SD helpers ============ */
@@ -243,8 +288,12 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+	FIL file_ecg, file_tst;
+	FRESULT fr;
+	RTC_DateTime ts_next;
+	uint32_t block_idx = 0;
 
-  /* USER CODE END 1 */
+	/* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -277,35 +326,54 @@ int main(void)
   // Configurar: 11:34:20, jueves (4), 2 octubre 2025
   //DS3231_SetTimeDate(11, 34, 20, 4, 2, 10, 25);
 
-  RTC_DateTime now;
-  char buf[64];
+
 
 
   /////////////////////////////////////////////////////
-  	log_uart("Inicialiazando....", 0 );
+log_uart("Inicialiazando....", 0 );
 
-  	/* Montar SD */
-    FRESULT fr;
-    fr = f_mount(&SDFatFs, "", 0);
-    log_uart("Montando SD", fr);
+	/* Montar SD */
+	//FRESULT fr;
+	fr = f_mount(&SDFatFs, "", 0);
+	log_uart("Montando SD", fr);
+	if (fr != FR_OK)
+	{
+		log_uart("Error montando SD", 0 );
+		while (1);  // aquí sabrás el código exacto
+	}
+//
+////Crear un nuevo archivo
+//fr = Open_Next_File(&file);
+//log_uart("Creando nuevo archivo", fr);
+//if (fr != FR_OK)
+//{
+//log_uart("Error creando nuevo archivo", 0 );
+//while (1);
+//}
+//
+////f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
+
+
+
+	log_uart("Creando los pares de archivos", fr);
+    fr = Open_Paired_Files(&file_ecg, &file_tst);
     if (fr != FR_OK)
     {
-    	log_uart("Error montando SD", 0 );
-        while (1);  // aquí sabrás el código exacto
-    }
+    	log_uart("Error Creando los pares de archivos", fr);
+         //Error_Handler();
+    	while (1);
+     }
 
-    //Crear un nuevo archivo
-    fr = Open_Next_File(&file);
-    log_uart("Creando nuevo archivo", fr);
-    if (fr != FR_OK)
+    log_uart("INIT ", 0);
+    for (int i=0; i<(2*3); i++)
     {
-    	log_uart("Error creando nuevo archivo", 0 );
-        while (1);
+    	HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    	HAL_Delay(50);
     }
 
-    //f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
-
-    /* Iniciar adquisición determinista: TIM2 -> ADC -> DMA (circular) */
+     // preparar primer timestamp
+	 DS3231_GetTimeDate(&ts_next);
+     /* Iniciar adquisición determinista: TIM2 -> ADC -> DMA (circular) */
     ECG_Start();
 
     /* Objetivo: 30 s @ 500 Hz => 15000 muestras */
@@ -316,29 +384,67 @@ int main(void)
     {
       if (half_ready)
       {
-    	  log_uart("half_ready", fr);
+    	log_uart("HR", 0);
 
         half_ready = 0;
+
         /* Escribir PRIMERA mitad del buffer: 1024 muestras => 2048 bytes (big-endian) */
-        write_half_bigendian(&file, &adcBuf[0], HALF_SAMPLES);
-        writtenSamples += HALF_SAMPLES;
+        write_timestamp_line(&file_tst, block_idx, &ts_next);
+		write_half_bigendian(&file_ecg, &adcBuf[0], HALF_SAMPLES);
+
+		// preparar siguiente timestamp
+		DS3231_GetTimeDate(&ts_next);
+		block_idx++;
+		writtenSamples += HALF_SAMPLES;
+
+		//
+		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+		HAL_Delay(10);
+		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+		//
+
       }
-      if (full_ready) {
+      if (full_ready)
+      {
+    	log_uart("FR", 0);
         full_ready = 0;
+
         /* Escribir SEGUNDA mitad del buffer */
-        write_half_bigendian(&file, &adcBuf[HALF_SAMPLES], HALF_SAMPLES);
+        write_timestamp_line(&file_tst, block_idx, &ts_next);
+        write_half_bigendian(&file_ecg, &adcBuf[HALF_SAMPLES], HALF_SAMPLES);
+
+        DS3231_GetTimeDate(&ts_next);
+        block_idx++;
         writtenSamples += HALF_SAMPLES;
+
+        //
+		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+		HAL_Delay(10);
+		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+		//
+
+
       }
+
+      /* Sync cada ~4 bloques (8KB) */
+        if ((writtenSamples % (HALF_SAMPLES*4)) == 0)
+        {
+            f_sync(&file_ecg);
+            f_sync(&file_tst);
+        }
     }
 
     ECG_Stop();
-    f_close(&file);
+
+    f_close(&file_ecg);
+    f_close(&file_tst);
+
     //f_mount(NULL, (TCHAR const*)SDPath, 1);   // desmontar
     //f_mount(NULL, (TCHAR const*)USERPath, 1);   // desmontar
 
-
     /* Señal de fin OK (parpadeo LED si quieres) */
-    while (1) {
+    while (1)
+    {
       HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
       HAL_Delay(300);
     }
@@ -348,22 +454,6 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-
-
-
-
-  /* Ejemplo recibir un byte */
-  //uint8_t rx_data;
-  //HAL_UART_Receive(&huart1, &rx_data, 1, HAL_MAX_DELAY);
-
-//  while (1)
-//  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-//	  HAL_UART_Transmit(&huart1, msg, sizeof(msg)-1, HAL_MAX_DELAY);
-//	  HAL_Delay(1000);   // retardo de 1000 ms = 1 segundo
-//  }
   /* USER CODE END 3 */
 }
 
