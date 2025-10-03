@@ -1,5 +1,11 @@
 /* USER CODE BEGIN Header */
 /**
+ * Version funcional 100$ ok
+ * Crea 2 archivos ECG y TST
+ * No aplica filtros digitales
+ * Avisa con flashes en el led de salida el progreso de la adquisicion
+ * Cuando termina de grabar, no se graba una linea adicional indicando la fecha-hora de cierre
+ *
   ******************************************************************************
   * @file           : main.c
   * @brief          : Main program body
