@@ -37,6 +37,15 @@
 #include <string.h>
 #include <stdio.h>
 
+#define ARM_MATH_CM3   // para tu STM32F1 (Cortex-M3)
+#include "arm_math.h"
+#include "filter_coeffs_q15.h"
+#define USE_FILTER   0//1   // pon 0 para grabar crudo
+#if USE_FILTER
+
+	static arm_biquad_casd_df1_inst_q15 S;
+#endif
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -69,6 +78,9 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 uint16_t adc_val = 0;
 char msg[32];
+
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -180,6 +192,171 @@ static FRESULT Open_Paired_Files(FIL *f_ecg, FIL *f_tst)
     return FR_DISK_ERR;
 }
 
+//FIltro digitl
+static inline uint16_t process_sample(uint16_t raw)
+{
+#if USE_FILTER
+    q15_t x = ADC_TO_Q15(raw);
+    q15_t y;
+    arm_biquad_cascade_df1_q15(&S, &x, &y, 1);
+    return Q15_TO_ADC(y);
+#else
+    return raw;
+#endif
+}
+
+///////////////////////////////////////+++++++++++++++++++++++++++++++
+#include <math.h>  // necesario para lroundf
+#include <stdbool.h>
+static const uint8_t  NOTCH_HZ = 60;      // 50, 60 o 0 (desactivado)
+/* ============== FILTROS ============== */
+/* Parámetros Hampel / Media móvil */
+#define HAMP_WIN 7
+#define HAMP_K   6.0f
+#define MA_WIN   9
+
+/* Estado de filtros */
+struct ECGFilt {
+  // High-pass 0.5 Hz (biquad)
+  float hp_b0, hp_b1, hp_b2, hp_a1, hp_a2;
+  float hp_x1, hp_x2, hp_y1, hp_y2;
+
+  // Notch opcional
+  bool  notch_en;
+  float no_b0, no_b1, no_b2, no_a1, no_a2;
+  float no_x1, no_x2, no_y1, no_y2;
+
+  // Hampel
+  float ring[HAMP_WIN];
+  int   idx;
+  bool  primed;
+
+  // Media móvil
+  float ma_ring[MA_WIN];
+  int   ma_idx;
+  float ma_sum;
+  bool  ma_primed;
+} g;
+
+
+static inline float biquad_step(float x,
+        float b0, float b1, float b2,
+        float a1, float a2,
+        float *x1, float *x2,
+        float *y1, float *y2)
+{
+    float y = b0*x + b1*(*x1) + b2*(*x2) - a1*(*y1) - a2*(*y2);
+    *x2 = *x1;
+    *x1 = x;
+    *y2 = *y1;
+    *y1 = y;
+    return y;
+}
+
+
+/* Inicializa High-pass 0.5 Hz (bilineal, Q ~ 0.707) */
+void biquad_init_hp_0p5Hz() {
+  const float fs = (float)FS_HZ;
+  const float fc = 0.5f;
+  const float q  = 0.707f;
+  const float K  = tanf(PI * fc / fs);
+  const float norm = 1.0f / (1.0f + K/q + K*K);
+  g.hp_b0 =  1.0f * norm;
+  g.hp_b1 = -2.0f * norm;
+  g.hp_b2 =  1.0f * norm;
+  g.hp_a1 =  2.0f*(K*K - 1.0f) * norm;
+  g.hp_a2 =  (1.0f - K/q + K*K) * norm;
+  g.hp_x1 = g.hp_x2 = g.hp_y1 = g.hp_y2 = 0.0f;
+}
+
+/* Inicializa Notch (50/60 Hz) con Q ~ 30 */
+void biquad_init_notch(uint8_t f0_hz) {
+  if (f0_hz == 0) { g.notch_en = false; return; }
+  const float fs   = (float)FS_HZ;
+  const float q    = 30.0f;
+  const float w0   = 2.0f*PI * (float)f0_hz / fs;
+  const float cosw = cosf(w0), sinw = sinf(w0);
+  const float alpha= sinw/(2.0f*q);
+
+  float b0=1.0f, b1=-2.0f*cosw, b2=1.0f;
+  float a0=1.0f+alpha, a1=-2.0f*cosw, a2=1.0f-alpha;
+
+  g.no_b0 = b0/a0; g.no_b1 = b1/a0; g.no_b2 = b2/a0;
+  g.no_a1 = a1/a0; g.no_a2 = a2/a0;
+  g.no_x1 = g.no_x2 = g.no_y1 = g.no_y2 = 0.0f;
+  g.notch_en = true;
+}
+
+/* Mediana y MAD de 7 (inserción) */
+static float median7(const float *v) {
+  float a[HAMP_WIN];
+  for (int i=0;i<HAMP_WIN;i++) a[i]=v[i];
+  for (int i=1;i<HAMP_WIN;i++){
+    float key=a[i]; int j=i-1;
+    while (j>=0 && a[j]>key){ a[j+1]=a[j]; j--; }
+    a[j+1]=key;
+  }
+  return a[HAMP_WIN/2];
+}
+static float mad7(const float *v, float med) {
+  float d[HAMP_WIN];
+  for (int i=0;i<HAMP_WIN;i++) d[i]=fabsf(v[i]-med);
+  for (int i=1;i<HAMP_WIN;i++){
+    float key=d[i]; int j=i-1;
+    while (j>=0 && d[j]>key){ d[j+1]=d[j]; j--; }
+    d[j+1]=key;
+  }
+  return 1.4826f * d[HAMP_WIN/2] + 1e-6f;
+}
+
+/* Init pipeline */
+void ecgFilt_init()
+{
+  memset(&g, 0, sizeof(g));
+  biquad_init_hp_0p5Hz();
+  biquad_init_notch(NOTCH_HZ); // 50, 60 o 0
+}
+
+/* Una muestra raw (centrada) -> filtrada */
+float ecgFilt_step(int16_t x_raw) {
+  float x = (float)x_raw;
+
+  // 1) High-pass 0.5 Hz
+  x = biquad_step(x, g.hp_b0,g.hp_b1,g.hp_b2,g.hp_a1,g.hp_a2,
+                     &g.hp_x1, &g.hp_x2, &g.hp_y1, &g.hp_y2);
+  // 2) Notch 50/60 (opcional)
+  if (g.notch_en) {
+    x = biquad_step(x, g.no_b0,g.no_b1,g.no_b2,g.no_a1,g.no_a2,
+    				&g.hp_x1, &g.hp_x2, &g.hp_y1, &g.hp_y2);
+  }
+  // 3) Hampel(7)
+  g.ring[g.idx] = x;
+  int center = g.idx;
+  g.idx = (g.idx + 1) % HAMP_WIN;
+  if (!g.primed && g.idx==0) g.primed = true;
+
+  float x_h = x;
+  if (g.primed) {
+    float w[HAMP_WIN];
+    for (int k=0;k<HAMP_WIN;k++){
+      int pos = (center - (HAMP_WIN-1) + k + HAMP_WIN) % HAMP_WIN;
+      w[k] = g.ring[pos];
+    }
+    float med = median7(w);
+    float mad = mad7(w, med);
+    if (fabsf(x - med) > HAMP_K * mad) x_h = med; // reemplaza outlier
+  }
+  // 4) Media móvil 9
+  g.ma_sum -= g.ma_ring[g.ma_idx];
+  g.ma_ring[g.ma_idx] = x_h;
+  g.ma_sum += x_h;
+  g.ma_idx = (g.ma_idx + 1) % MA_WIN;
+  if (!g.ma_primed && g.ma_idx==0) g.ma_primed = true;
+
+  float y = g.ma_primed ? (g.ma_sum/(float)MA_WIN) : x_h;
+  return y;
+}
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -188,6 +365,7 @@ static FRESULT Open_Paired_Files(FIL *f_ecg, FIL *f_tst)
 /* ---- Parámetros de adquisición ---- */
 #define LED_GPIO_Port GPIOC
 #define LED_Pin GPIO_PIN_14
+
 #define ECG_FS_HZ            500U
 #define HALF_SAMPLES         1024U          // media del buffer
 #define BUF_SAMPLES          (HALF_SAMPLES*2)
@@ -195,6 +373,9 @@ static uint16_t adcBuf[BUF_SAMPLES];        // buffer circular DMA (ping-pong)
 
 static volatile uint8_t half_ready = 0;
 static volatile uint8_t full_ready = 0;
+
+//tal vez
+static volatile uint16_t procBuf[BUF_SAMPLES];  // salida procesada
 
 /* ---- SD/FatFS ---- */
 FATFS SDFatFs;
@@ -327,6 +508,16 @@ int main(void)
   MX_TIM2_Init();
   MX_I2C1_Init();
 
+	#if USE_FILTER
+  	  arm_biquad_cascade_df1_init_q15(&S, NUM_STAGES,
+                                  biquadCoeffs_q15,
+                                  biquadState_q15,
+                                  POST_SHIFT);
+  	#endif
+
+  // Filtros
+  ecgFilt_init();
+
 
   /* USER CODE BEGIN 2 */
   // Configurar: 11:34:20, jueves (4), 2 octubre 2025
@@ -394,9 +585,47 @@ log_uart("Inicialiazando....", 0 );
 
         half_ready = 0;
 
+        //Added
+//        for (UINT i = 0; i < HALF_SAMPLES; i++)
+//        {
+//            adcBuf[i] = process_sample(adcBuf[i]);
+//        }
+        //
+        // El offset de escritura es 0 (primera mitad de procBuf)
+        uint16_t *dest_ptr = &procBuf[0];
+
+        for (UINT i = 0; i < HALF_SAMPLES; i++)
+        {
+        	uint16_t raw  = adcBuf[i];
+
+        	// 1. Centrado (Correcto)
+			int16_t centered = (int16_t)((int32_t)raw - 2048);
+
+			// 2. Filtrado (Correcto)
+			float y = ecgFilt_step(centered);
+
+			// 3. ¡Descentrado (Corrección)!
+
+			// Convertimos de float a int32 (redondeo)
+			int32_t s_centered = lroundf(y);
+
+			// Sumamos el offset (2048) para devolver al rango 0-4095
+			int32_t s_unsigned = s_centered + 2048;
+
+			// Aseguramos que no nos salimos del rango (Clamping/Saturación)
+			if (s_unsigned < 0) s_unsigned = 0;
+			if (s_unsigned > 4095) s_unsigned = 4095;
+
+			uint16_t u = (uint16_t)s_unsigned;
+
+			dest_ptr[i] = u; // ¡Ahora escribe la señal filtrada en el rango 0-4095
+        }
+
+
         /* Escribir PRIMERA mitad del buffer: 1024 muestras => 2048 bytes (big-endian) */
         write_timestamp_line(&file_tst, block_idx, &ts_next);
-		write_half_bigendian(&file_ecg, &adcBuf[0], HALF_SAMPLES);
+		//write_half_bigendian(&file_ecg, &adcBuf[0], HALF_SAMPLES);
+		write_half_bigendian(&file_ecg, &procBuf[0], HALF_SAMPLES);
 
 		// preparar siguiente timestamp
 		DS3231_GetTimeDate(&ts_next);
@@ -415,9 +644,47 @@ log_uart("Inicialiazando....", 0 );
     	log_uart("FR", 0);
         full_ready = 0;
 
+        //added filtro
+//        for (UINT i = 0; i < HALF_SAMPLES; i++)
+//        {
+//            adcBuf[HALF_SAMPLES + i] = process_sample(adcBuf[HALF_SAMPLES + i]);
+//        }
+        uint16_t *dest_ptr = &procBuf[HALF_SAMPLES];
+
+        for (UINT i = 0; i < HALF_SAMPLES; i++)
+		{
+			uint16_t raw  = adcBuf[HALF_SAMPLES + i];
+
+
+			// 1. Centrado (Correcto)
+			int16_t centered = (int16_t)((int32_t)raw - 2048);
+
+			// 2. Filtrado (Correcto)
+			float y = ecgFilt_step(centered);
+
+			// 3. ¡Descentrado (Corrección)!
+
+			// Convertimos de float a int32 (redondeo)
+			int32_t s_centered = lroundf(y);
+
+			// Sumamos el offset (2048) para devolver al rango 0-4095
+			int32_t s_unsigned = s_centered + 2048;
+
+			// Aseguramos que no nos salimos del rango (Clamping/Saturación)
+			if (s_unsigned < 0) s_unsigned = 0;
+			if (s_unsigned > 4095) s_unsigned = 4095;
+
+			uint16_t u = (uint16_t)s_unsigned;
+
+			dest_ptr[i] = u; // ¡Ahora escribe la señal filtrada en el rango 0-4095!
+		}
+
+
         /* Escribir SEGUNDA mitad del buffer */
         write_timestamp_line(&file_tst, block_idx, &ts_next);
-        write_half_bigendian(&file_ecg, &adcBuf[HALF_SAMPLES], HALF_SAMPLES);
+        //write_half_bigendian(&file_ecg, &adcBuf[HALF_SAMPLES], HALF_SAMPLES);
+        //write_half_bigendian(&file_ecg, &procBuf[0], HALF_SAMPLES);
+        write_half_bigendian(&file_ecg, &procBuf[HALF_SAMPLES], HALF_SAMPLES);
 
         DS3231_GetTimeDate(&ts_next);
         block_idx++;
