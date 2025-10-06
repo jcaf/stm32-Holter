@@ -1,10 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
- * Version funcional 100$ ok
- * Crea 2 archivos ECG y TST
- * No aplica filtros digitales
- * Avisa con flashes en el led de salida el progreso de la adquisicion
- * Cuando termina de grabar, no se graba una linea adicional indicando la fecha-hora de cierre
+ * Version funcional 100% ok
+
  *
   ******************************************************************************
   * @file           : main.c
@@ -84,7 +81,7 @@ char msg[32];
 // NUEVAS BANDERAS:
 static volatile uint8_t power_fail_flag = 0; // Flag de alerta desde EXTI
 static volatile uint8_t acquiring_data = 0;  // Flag de estado del sistema
-
+volatile uint8_t power_is_on = 1;
 
 
 /* USER CODE END PV */
@@ -298,7 +295,8 @@ void biquad_init_hp_0p5Hz() {
 }
 
 /* Inicializa Notch (50/60 Hz) con Q ~ 30 */
-void biquad_init_notch(uint8_t f0_hz) {
+void biquad_init_notch(uint8_t f0_hz)
+{
   if (f0_hz == 0) { g.notch_en = false; return; }
   const float fs   = (float)FS_HZ;
   const float q    = 30.0f;
@@ -487,10 +485,23 @@ static void Safe_Shutdown(FIL *f_ecg, FIL *f_tst)
     write_log_line(f_tst, "CLOSE", 0, &dt_close);
 
     // 4. Sincronizar y cerrar archivos (Operaciones críticas)
+    uint32_t t0 = HAL_GetTick();
+
     f_sync(f_ecg);
     f_sync(f_tst);
     f_close(f_ecg);
     f_close(f_tst);
+
+
+    // si toma demasiado tiempo, fuerza apagado físico
+    if (HAL_GetTick() - t0 > 1000)
+    {
+        // algo falló, desmonta igualmente
+        f_mount(NULL, "", 0);
+    }
+
+    // desmonta SD
+    f_mount(NULL, "", 0);
 
     // 5. Señalizar que el programa debe terminar
     acquiring_data = 0;
@@ -501,15 +512,42 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == PF_ALERT_Pin)
     {
-        // 1. Deshabilitar la interrupción para evitar rebotes o re-entradas.
-        HAL_NVIC_DisableIRQ(EXTI0_IRQn);
+    	if (power_is_on)
+		{
+    		//flanco descendente
+    		power_is_on = 0;
 
-        // 2. Detener la adquisición inmediatamente (crítico para la integridad de los buffers DMA)
-        ECG_Stop(); // Detiene ADC/DMA/Timer
+			// 1. Deshabilitar la interrupción para evitar rebotes o re-entradas.
+			HAL_NVIC_DisableIRQ(EXTI0_IRQn);
 
-        // 3. Establecer el flag de falla para que el main() ejecute el cierre seguro (FatFS)
-        power_fail_flag = 1;
+			// 2. Detener la adquisición inmediatamente (crítico para la integridad de los buffers DMA)
+//			__disable_irq();
+//			ECG_Stop(); // Detiene ADC/DMA/Timer
+//			__enable_irq();
+			// 3. Establecer el flag de falla para que el main() ejecute el cierre seguro (FatFS)
+			power_fail_flag = 1;
+		}
+    	else
+    	{
+    		//flanco ascendente
+			NVIC_SystemReset(); // reinicio seguro
+    	}
     }
+}
+
+void Reconfigure_EXTI0_Rising(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    HAL_NVIC_DisableIRQ(EXTI0_IRQn);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 }
 
 /* USER CODE END 0 */
@@ -527,6 +565,7 @@ int main(void)
 	RTC_DateTime ts_next;
 	uint32_t block_idx = 0;
 
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -542,7 +581,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  HAL_Delay(30);
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -558,8 +597,7 @@ int main(void)
   // Configurar: 11:34:20, jueves (4), 2 octubre 2025
   //DS3231_SetTimeDate(11, 34, 20, 4, 2, 10, 25);
 
-
-
+  ecgFilt_init();
 
   /////////////////////////////////////////////////////
   log_uart("Inicialiazando....", 0 );
@@ -608,18 +646,19 @@ int main(void)
     /* Objetivo: 30 s @ 500 Hz => 15000 muestras */
     uint32_t targetSamples  = 5U * ECG_FS_HZ;
     uint32_t writtenSamples = 0;
-
     //while (writtenSamples < targetSamples)
 	while 	(acquiring_data)
     {
-
-		//MANEJO DE FALLA DE ENERGÍA
 		if (power_fail_flag)
 		{
 		  // La EXTI Callback ya ha detenido la adquisición (ECG_Stop())
 		  log_uart("Bateria off", 0);
-		  Safe_Shutdown(&file_ecg, &file_tst); // Ejecuta FatFS f_close()
-		  break; // Sale del bucle para detener la ejecución
+		  __disable_irq();
+		  ECG_Stop(); // Detiene ADC/DMA/Timer
+		  Safe_Shutdown(&file_ecg, &file_tst); 	// Ejecuta FatFS f_close()
+		  __enable_irq();
+
+		  break; 								// Sale del bucle para detener la ejecución
 		}
 
       if (half_ready)
@@ -728,26 +767,31 @@ int main(void)
 //    f_close(&file_ecg);
 //    f_close(&file_tst);
 
-	__disable_irq(); // Deshabilitar interrupciones para un estado final estable
-
 	log_uart("fin logueo", 0);
-    /* Señal de fin OK (parpadeo LED si quieres) */
-    while (1)
+
+	/* Señal de fin OK (parpadeo LED si quieres) */
+    for (int i=0; i< (2*3); i++)
     {
-//      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-//      HAL_Delay(300);
+      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+      HAL_Delay(300);
     }
+
+    // Reconfigura PA0 para detectar el retorno (flanco ascendente)
+   Reconfigure_EXTI0_Rising();
+   //__WFI(); // espera en bajo consumo
+   HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+   while (1)
+   {
+	   ;
+   }
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
   /* USER CODE END 3 */
 }
 
