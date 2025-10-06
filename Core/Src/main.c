@@ -79,6 +79,12 @@ UART_HandleTypeDef huart1;
 uint16_t adc_val = 0;
 char msg[32];
 
+#define PF_ALERT_GPIO_Port GPIOA
+#define PF_ALERT_Pin       GPIO_PIN_0 // El pin EXTI0
+// NUEVAS BANDERAS:
+static volatile uint8_t power_fail_flag = 0; // Flag de alerta desde EXTI
+static volatile uint8_t acquiring_data = 0;  // Flag de estado del sistema
+
 
 
 /* USER CODE END PV */
@@ -146,7 +152,29 @@ static FRESULT write_timestamp_line(FIL *ftime, uint32_t block_idx, const RTC_Da
     UINT bw = 0;
     return f_write(ftime, line, n, &bw);
 }
+/* ----------------- helpers ------------------ */
+// Función de log unificada para OPEN, CLOSE y BLOCK
+static FRESULT write_log_line(FIL *ftime, const char *prefix, uint32_t block_idx, const RTC_DateTime *dt)
+{
+    char line[64];
+    int n;
+    UINT bw = 0;
 
+    if (strcmp(prefix, "BLOCK") == 0) {
+        // Formato: 000000,YYYY-MM-DD HH:MM:SS
+        n = snprintf(line, sizeof(line), "%06lu,%04u-%02u-%02u %02u:%02u:%02u\r\n",
+                     (unsigned long)block_idx,
+                     2000 + dt->year, dt->month, dt->date,
+                     dt->hour, dt->min, dt->sec);
+    } else { // "OPEN" o "CLOSE"
+        // Formato: OPEN,YYYY-MM-DD HH:MM:SS
+        n = snprintf(line, sizeof(line), "%s,%04u-%02u-%02u %02u:%02u:%02u\r\n",
+                     prefix,
+                     2000 + dt->year, dt->month, dt->date,
+                     dt->hour, dt->min, dt->sec);
+    }
+    return f_write(ftime, line, n, &bw);
+}
 /* Use consistent HAL I2C functions: */
 void DS3231_GetTimeDate(RTC_DateTime *dt)
 {
@@ -423,28 +451,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 }
 
-/* ============ SD helpers ============ */
-
-/* Abre el siguiente FILE_###.ECG disponible */
-static FRESULT Open_Next_File(FIL *fp)
-{
-  char name[24];
-
-  for (int i = 1; i < 1000; ++i)
-  {
-    snprintf(name, sizeof(name), "FILE_%03d.ECG", i);
-
-    FILINFO finfo;
-
-    if (f_stat(name, &finfo) == FR_OK)
-      continue;        // existe, prueba siguiente
-
-    return f_open(fp, name, FA_CREATE_ALWAYS | FA_WRITE | FA_READ);
-
-  }
-  return FR_DISK_ERR;
-}
-
 /* Escribe N muestras en big-endian (alto luego bajo) en múltiplos de 512B */
 static void write_half_bigendian(FIL *fp, const uint16_t *src, UINT nSamples)
 {
@@ -465,6 +471,47 @@ static void write_half_bigendian(FIL *fp, const uint16_t *src, UINT nSamples)
   }
 }
 
+
+/* ---- Nuevo: Función de Cierre Seguro (Safe Shutdown) ---- */
+static void Safe_Shutdown(FIL *f_ecg, FIL *f_tst)
+{
+    RTC_DateTime dt_close;
+
+    // 1. Detener adquisición DMA/Timer
+    ECG_Stop();
+
+    // 2. Obtener hora de cierre del DS3231 (usa la energía del supercapacitor)
+    DS3231_GetTimeDate(&dt_close);
+
+    // 3. Escribir la marca de cierre en el log .TST
+    write_log_line(f_tst, "CLOSE", 0, &dt_close);
+
+    // 4. Sincronizar y cerrar archivos (Operaciones críticas)
+    f_sync(f_ecg);
+    f_sync(f_tst);
+    f_close(f_ecg);
+    f_close(f_tst);
+
+    // 5. Señalizar que el programa debe terminar
+    acquiring_data = 0;
+}
+
+/* ---- Callback de Interrupción Externa (PA0 / PF_ALERT) ---- */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == PF_ALERT_Pin)
+    {
+        // 1. Deshabilitar la interrupción para evitar rebotes o re-entradas.
+        HAL_NVIC_DisableIRQ(EXTI0_IRQn);
+
+        // 2. Detener la adquisición inmediatamente (crítico para la integridad de los buffers DMA)
+        ECG_Stop(); // Detiene ADC/DMA/Timer
+
+        // 3. Establecer el flag de falla para que el main() ejecute el cierre seguro (FatFS)
+        power_fail_flag = 1;
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -480,7 +527,7 @@ int main(void)
 	RTC_DateTime ts_next;
 	uint32_t block_idx = 0;
 
-	/* USER CODE END 1 */
+  /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -507,18 +554,6 @@ int main(void)
   MX_FATFS_Init();
   MX_TIM2_Init();
   MX_I2C1_Init();
-
-	#if USE_FILTER
-  	  arm_biquad_cascade_df1_init_q15(&S, NUM_STAGES,
-                                  biquadCoeffs_q15,
-                                  biquadState_q15,
-                                  POST_SHIFT);
-  	#endif
-
-  // Filtros
-  ecgFilt_init();
-
-
   /* USER CODE BEGIN 2 */
   // Configurar: 11:34:20, jueves (4), 2 octubre 2025
   //DS3231_SetTimeDate(11, 34, 20, 4, 2, 10, 25);
@@ -527,7 +562,7 @@ int main(void)
 
 
   /////////////////////////////////////////////////////
-log_uart("Inicialiazando....", 0 );
+  log_uart("Inicialiazando....", 0 );
 
 	/* Montar SD */
 	//FRESULT fr;
@@ -538,19 +573,6 @@ log_uart("Inicialiazando....", 0 );
 		log_uart("Error montando SD", 0 );
 		while (1);  // aquí sabrás el código exacto
 	}
-//
-////Crear un nuevo archivo
-//fr = Open_Next_File(&file);
-//log_uart("Creando nuevo archivo", fr);
-//if (fr != FR_OK)
-//{
-//log_uart("Error creando nuevo archivo", 0 );
-//while (1);
-//}
-//
-////f_open(&file, "FILE_001.ECG", FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
-
-
 
 	log_uart("Creando los pares de archivos", fr);
     fr = Open_Paired_Files(&file_ecg, &file_tst);
@@ -561,12 +583,22 @@ log_uart("Inicialiazando....", 0 );
     	while (1);
      }
 
-    log_uart("INIT ", 0);
+   // NUEVO: Registrar hora de apertura ("OPEN")
+
+   DS3231_GetTimeDate(&ts_next);
+   write_log_line(&file_tst, "OPEN", 0, &ts_next);
+   f_sync(&file_tst); // Escribir inmediatamente la marca de apertura
+
+
+   log_uart("INIT ", 0);
     for (int i=0; i<(2*3); i++)
     {
     	HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
     	HAL_Delay(50);
     }
+
+    // NUEVO: Activar flag de adquisición
+	 acquiring_data = 1;
 
      // preparar primer timestamp
 	 DS3231_GetTimeDate(&ts_next);
@@ -577,20 +609,25 @@ log_uart("Inicialiazando....", 0 );
     uint32_t targetSamples  = 5U * ECG_FS_HZ;
     uint32_t writtenSamples = 0;
 
-    while (writtenSamples < targetSamples)
+    //while (writtenSamples < targetSamples)
+	while 	(acquiring_data)
     {
+
+		//MANEJO DE FALLA DE ENERGÍA
+		if (power_fail_flag)
+		{
+		  // La EXTI Callback ya ha detenido la adquisición (ECG_Stop())
+		  log_uart("Bateria off", 0);
+		  Safe_Shutdown(&file_ecg, &file_tst); // Ejecuta FatFS f_close()
+		  break; // Sale del bucle para detener la ejecución
+		}
+
       if (half_ready)
       {
     	log_uart("HR", 0);
 
         half_ready = 0;
 
-        //Added
-//        for (UINT i = 0; i < HALF_SAMPLES; i++)
-//        {
-//            adcBuf[i] = process_sample(adcBuf[i]);
-//        }
-        //
         // El offset de escritura es 0 (primera mitad de procBuf)
         uint16_t *dest_ptr = &procBuf[0];
 
@@ -600,31 +637,24 @@ log_uart("Inicialiazando....", 0 );
 
         	// 1. Centrado (Correcto)
 			int16_t centered = (int16_t)((int32_t)raw - 2048);
-
 			// 2. Filtrado (Correcto)
 			float y = ecgFilt_step(centered);
-
-			// 3. ¡Descentrado (Corrección)!
-
+			// 3.Descentrado (Corrección)
 			// Convertimos de float a int32 (redondeo)
 			int32_t s_centered = lroundf(y);
-
 			// Sumamos el offset (2048) para devolver al rango 0-4095
 			int32_t s_unsigned = s_centered + 2048;
-
 			// Aseguramos que no nos salimos del rango (Clamping/Saturación)
 			if (s_unsigned < 0) s_unsigned = 0;
 			if (s_unsigned > 4095) s_unsigned = 4095;
 
 			uint16_t u = (uint16_t)s_unsigned;
-
-			dest_ptr[i] = u; // ¡Ahora escribe la señal filtrada en el rango 0-4095
+			dest_ptr[i] = u; //Ahora escribe la señal filtrada en el rango 0-4095
         }
 
-
         /* Escribir PRIMERA mitad del buffer: 1024 muestras => 2048 bytes (big-endian) */
-        write_timestamp_line(&file_tst, block_idx, &ts_next);
-		//write_half_bigendian(&file_ecg, &adcBuf[0], HALF_SAMPLES);
+        //write_timestamp_line(&file_tst, block_idx, &ts_next);
+        write_log_line(&file_tst, "BLOCK", block_idx, &ts_next); // Usar "BLOCK"
 		write_half_bigendian(&file_ecg, &procBuf[0], HALF_SAMPLES);
 
 		// preparar siguiente timestamp
@@ -644,46 +674,33 @@ log_uart("Inicialiazando....", 0 );
     	log_uart("FR", 0);
         full_ready = 0;
 
-        //added filtro
-//        for (UINT i = 0; i < HALF_SAMPLES; i++)
-//        {
-//            adcBuf[HALF_SAMPLES + i] = process_sample(adcBuf[HALF_SAMPLES + i]);
-//        }
         uint16_t *dest_ptr = &procBuf[HALF_SAMPLES];
 
         for (UINT i = 0; i < HALF_SAMPLES; i++)
 		{
 			uint16_t raw  = adcBuf[HALF_SAMPLES + i];
 
-
 			// 1. Centrado (Correcto)
 			int16_t centered = (int16_t)((int32_t)raw - 2048);
-
 			// 2. Filtrado (Correcto)
 			float y = ecgFilt_step(centered);
-
-			// 3. ¡Descentrado (Corrección)!
-
+			// 3. Descentrado (Corrección)
 			// Convertimos de float a int32 (redondeo)
 			int32_t s_centered = lroundf(y);
-
 			// Sumamos el offset (2048) para devolver al rango 0-4095
 			int32_t s_unsigned = s_centered + 2048;
-
 			// Aseguramos que no nos salimos del rango (Clamping/Saturación)
 			if (s_unsigned < 0) s_unsigned = 0;
 			if (s_unsigned > 4095) s_unsigned = 4095;
 
 			uint16_t u = (uint16_t)s_unsigned;
-
-			dest_ptr[i] = u; // ¡Ahora escribe la señal filtrada en el rango 0-4095!
+			dest_ptr[i] = u; //Ahora escribe la señal filtrada en el rango 0-4095
 		}
 
 
         /* Escribir SEGUNDA mitad del buffer */
-        write_timestamp_line(&file_tst, block_idx, &ts_next);
-        //write_half_bigendian(&file_ecg, &adcBuf[HALF_SAMPLES], HALF_SAMPLES);
-        //write_half_bigendian(&file_ecg, &procBuf[0], HALF_SAMPLES);
+        //write_timestamp_line(&file_tst, block_idx, &ts_next);
+        write_log_line(&file_tst, "BLOCK", block_idx, &ts_next); // Usar "BLOCK"
         write_half_bigendian(&file_ecg, &procBuf[HALF_SAMPLES], HALF_SAMPLES);
 
         DS3231_GetTimeDate(&ts_next);
@@ -695,8 +712,6 @@ log_uart("Inicialiazando....", 0 );
 		HAL_Delay(10);
 		HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
 		//
-
-
       }
 
       /* Sync cada ~4 bloques (8KB) */
@@ -706,27 +721,33 @@ log_uart("Inicialiazando....", 0 );
             f_sync(&file_tst);
         }
     }
+	//
 
-    ECG_Stop();
+	// ELIMINADAS las llamadas a ECG_Stop() y f_close() ya que están en Safe_Shutdown.
+//    ECG_Stop();
+//    f_close(&file_ecg);
+//    f_close(&file_tst);
 
-    f_close(&file_ecg);
-    f_close(&file_tst);
+	__disable_irq(); // Deshabilitar interrupciones para un estado final estable
 
-    //f_mount(NULL, (TCHAR const*)SDPath, 1);   // desmontar
-    //f_mount(NULL, (TCHAR const*)USERPath, 1);   // desmontar
-
+	log_uart("fin logueo", 0);
     /* Señal de fin OK (parpadeo LED si quieres) */
     while (1)
     {
-      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-      HAL_Delay(300);
+//      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//      HAL_Delay(300);
     }
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
 
+    /* USER CODE BEGIN 3 */
+  }
   /* USER CODE END 3 */
 }
 
@@ -1034,12 +1055,22 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PA0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PA4 */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
